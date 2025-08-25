@@ -12,6 +12,7 @@
   },
   "loading": {
     "initializing": "初始化 Wiki 產生...",
+    "cloningRepository": "下載儲存庫...",
     "fetchingStructure": "取得儲存庫結構...",
     "determiningStructure": "驗證 Wiki 結構...",
     "clearingCache": "清除伺服器快取...",

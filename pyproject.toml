@@ -29,3 +29,20 @@ dependencies = [
   # @see https://github.com/urllib3/urllib3/issues/3571
   "urllib3<2.4.0; python_version >= '3.13'",
 ]
+
+[tool.ruff]
+preview = true
+line-length = 120
+target-version = 'py312'
+exclude = [
+  ".git",
+  ".mypy_cache",
+  ".venv",
+  ".venv-*",
+  "stubs",
+  "typings",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "FURB", "SIM"]
+ignore = ["E203"]

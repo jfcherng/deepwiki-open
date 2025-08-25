@@ -134,7 +134,7 @@ export default function Home() {
   const [excludedFiles, setExcludedFiles] = useState('');
   const [includedDirs, setIncludedDirs] = useState('');
   const [includedFiles, setIncludedFiles] = useState('');
-  const [selectedPlatform, setSelectedPlatform] = useState<'github' | 'gitlab' | 'bitbucket'>('github');
+  const [selectedPlatform, setSelectedPlatform] = useState<'github' | 'gitlab' | 'bitbucket' | 'gerrit'>('github');
   const [accessToken, setAccessToken] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -190,6 +190,11 @@ export default function Home() {
     const windowsPathRegex = /^[a-zA-Z]:\\(?:[^\\/:*?"<>|\r\n]+\\)*[^\\/:*?"<>|\r\n]*$/;
     const customGitRegex = /^(?:https?:\/\/)?([^\/]+)\/(.+?)\/([^\/]+)(?:\.git)?\/?$/;
 
+    // Some URL formats...
+    // - https://release-git.rtkbf.com/gerrit/sdlc/admin/repos/sdlc/realtek_release,general
+    // - git clone "https://release-git.rtkbf.com/gerrit/sdlc/realtek_release"
+    const rtkGerritRegex = /^https?:\/\/(?:.+)\.(?:rtkbf|realtek)\.com\/gerrit\/(?:admin\/repos\/)?([^,?]+)/;
+
     if (windowsPathRegex.test(input)) {
       type = 'local';
       localPath = input;
@@ -202,6 +207,18 @@ export default function Home() {
       localPath = input;
       repo = input.split('/').filter(Boolean).pop() || 'local-repo';
       owner = 'local';
+    }
+    // Handle Realtek Gerrit
+    else if (rtkGerritRegex.test(input)) {
+      type = 'gerrit';
+      owner = 'realtek-gerrit'; // what's the definition of the owner here for gerrit?
+
+      const m: RegExpExecArray | null = rtkGerritRegex.exec(input);
+      if (m) {
+        repo = m[1]?.replace(/\.git$/, '') || '';
+      }
+
+      fullPath = extractUrlPath(input)?.replace(/\.git$/, '');
     }
     else if (customGitRegex.test(input)) {
       // Detect repository type based on domain
@@ -255,7 +272,7 @@ export default function Home() {
     const parsedRepo = parseRepositoryInput(repositoryInput);
 
     if (!parsedRepo) {
-      setError('Invalid repository format. Use "owner/repo", GitHub/GitLab/BitBucket URL, or a local folder path like "/path/to/folder" or "C:\\path\\to\\folder".');
+      setError('Invalid repository format. Use "owner/repo", RtkGerrit/GitHub/GitLab/BitBucket URL, or a local folder path like "/path/to/folder" or "C:\\path\\to\\folder".');
       return;
     }
 
@@ -336,7 +353,7 @@ export default function Home() {
     const parsedRepo = parseRepositoryInput(repositoryInput);
 
     if (!parsedRepo) {
-      setError('Invalid repository format. Use "owner/repo", GitHub/GitLab/BitBucket URL, or a local folder path like "/path/to/folder" or "C:\\path\\to\\folder".');
+      setError('Invalid repository format. Use "owner/repo", RtkGerrit/GitHub/GitLab/BitBucket URL, or a local folder path like "/path/to/folder" or "C:\\path\\to\\folder".');
       setIsSubmitting(false);
       return;
     }
@@ -385,7 +402,7 @@ export default function Home() {
     const queryString = params.toString() ? `?${params.toString()}` : '';
 
     // Navigate to the dynamic route
-    router.push(`/${owner}/${repo}${queryString}`);
+    router.push(`/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}${queryString}`);
 
     // The isSubmitting state will be reset when the component unmounts during navigation
   };

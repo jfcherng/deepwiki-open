@@ -1,15 +1,19 @@
 import os
 import logging
+import subprocess
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
-from typing import List, Optional, Dict, Any, Literal
+from typing import Annotated, List, Optional, Dict, Any, Literal
+from pathlib import Path
 import json
 from datetime import datetime
 from pydantic import BaseModel, Field
 import google.generativeai as genai
 import asyncio
+from adalflow.utils import get_adalflow_default_root_path
 
+from api.data_pipeline import DatabaseManager, download_repo
 # Configure logging
 from api.logging_config import setup_logging
 
@@ -31,10 +35,6 @@ app.add_middleware(
     allow_methods=["*"],  # Allows all methods
     allow_headers=["*"],  # Allows all headers
 )
-
-# Helper function to get adalflow root path
-def get_adalflow_default_root_path():
-    return os.path.expanduser(os.path.join("~", ".adalflow"))
 
 # --- Pydantic Models ---
 class WikiPage(BaseModel):
@@ -116,6 +116,23 @@ class WikiExportRequest(BaseModel):
     repo_url: str = Field(..., description="URL of the repository")
     pages: List[WikiPage] = Field(..., description="List of wiki pages to export")
     format: Literal["markdown", "json"] = Field(..., description="Export format (markdown or json)")
+
+class GetClonedRepoStructureRequest(BaseModel):
+    """
+    Model for the request body when getting the structure of a cloned repo.
+    """
+    owner: str
+    repo: str
+    type: str
+    token: str | None = None
+    localPath: str | None = None
+    repoUrl: str | None = None
+
+class CloneRepoRequest(BaseModel):
+    """
+    Model for the request body when cloning a repo.
+    """
+    repo: RepoInfo
 
 # --- Model Configuration Models ---
 class Model(BaseModel):
@@ -272,6 +289,74 @@ async def export_wiki(request: WikiExportRequest):
         logger.error(error_msg)
         raise HTTPException(status_code=500, detail=error_msg)
 
+@app.get("/cloned_repo/structure")
+async def get_cloned_repo_structure(repo_info: Annotated[GetClonedRepoStructureRequest, Query()]):
+    content = {
+        "branch": "",
+        "file_tree": "",
+        "readme": "",
+    }
+
+    root_path = get_adalflow_default_root_path()
+
+    # local path
+    if repo_info.localPath:
+        save_repo_dir = repo_info.localPath
+    # url
+    elif repo_info.repoUrl:
+        assert repo_info.repoUrl.startswith("https://") or repo_info.repoUrl.startswith("http://")
+        safe_repo_name = DatabaseManager.extract_safe_repo_path_from_url(repo_info.repoUrl, repo_info.type)
+        save_repo_dir = os.path.join(root_path, "repos", safe_repo_name)
+    else:
+        return JSONResponse(status_code=400, content={"error": "Either repoUrl or localPath must be provided."})
+
+    if not os.path.isdir(save_repo_dir):
+        return JSONResponse(status_code=404, content={"error": f"Repository directory not found: {save_repo_dir}"})
+
+    logger.info(f"Processing local repository directory at: {save_repo_dir}")
+
+    # get branch name
+    proc = subprocess.Popen(
+        ["git", "-C", save_repo_dir, "rev-parse", "--abbrev-ref", "HEAD"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+        text=True,  # decode to string instead of bytes
+    )
+    stdout, stderr = proc.communicate()
+    if str(proc.returncode) == "0":
+        content["branch"] = stdout.strip()  # maybe "HEAD" if in detached head state
+
+    file_tree_lines: list[str] = []
+    readme_content = ""
+
+    excluded_dirs = {".git", ".svn", ".venv", "__pycache__", "node_modules"}
+    excluded_files = {".DS_Store", ".git", "__init__.py"}
+    try:
+        for root, dirs, files in os.walk(save_repo_dir):
+            root_ = Path(root)
+            dirs[:] = [d for d in dirs if not (d.startswith('.') or d in excluded_dirs)]
+            for file in files:
+                if file.startswith('.') or file in excluded_files:
+                    continue
+                rel_file = root_.relative_to(save_repo_dir) / file
+                file_tree_lines.append(str(rel_file))
+                if file.lower() == "readme.md" and not readme_content:
+                    try:
+                        readme_content = (root_ / file).read_text(encoding="utf-8")
+                    except Exception as e:
+                        logger.warning(f"Could not read README.md: {e}")
+                        readme_content = ""
+    except Exception as e:
+        error_msg = f"Failed processing local repository: {e}"
+        logger.error(error_msg)
+        return JSONResponse(status_code=500, content={"error": error_msg})
+
+    file_tree_lines.sort()
+    content["file_tree"] = "\n".join(file_tree_lines)
+    content["readme"] = readme_content
+    return JSONResponse(content)
+
 @app.get("/local_repo/structure")
 async def get_local_repo_structure(path: str = Query(None, description="Path to local repository")):
     """Return the file tree and README content for a local repository."""
@@ -407,6 +492,7 @@ os.makedirs(WIKI_CACHE_DIR, exist_ok=True)
 
 def get_wiki_cache_path(owner: str, repo: str, repo_type: str, language: str) -> str:
     """Generates the file path for a given wiki cache."""
+    repo = repo.replace("/", "__")  # make repo name filesystem-safe
     filename = f"deepwiki_cache_{repo_type}_{owner}_{repo}_{language}.json"
     return os.path.join(WIKI_CACHE_DIR, filename)
 
@@ -573,6 +659,51 @@ async def root():
         "endpoints": endpoints
     }
 
+@app.post("/clone_repo")
+async def do_clone_repo(request: CloneRepoRequest):
+    """
+    Clone the repository to local disk.
+
+    Paths:
+        ~/.adalflow/repos/{owner}_{repo_name} (for url, local path will be the same)
+        ~/.adalflow/databases/{owner}_{repo_name}.pkl
+    """
+    repo_info = request.repo
+    logger.info(f"Preparing repo storage for {repo_info.repoUrl} ...")
+    try:
+        root_path = get_adalflow_default_root_path()
+
+        os.makedirs(root_path, exist_ok=True)
+
+        # local path
+        if repo_info.localPath:
+            safe_repo_name = os.path.basename(repo_info.localPath)
+            save_repo_dir = repo_info.localPath
+        # url
+        elif repo_info.repoUrl:
+            assert repo_info.repoUrl.startswith("https://") or repo_info.repoUrl.startswith("http://")
+            # Extract the repository name from the URL
+            safe_repo_name = DatabaseManager.extract_safe_repo_path_from_url(repo_info.repoUrl, repo_info.type)
+            logger.info(f"Extracted repo name: {safe_repo_name}")
+
+            save_repo_dir = os.path.join(root_path, "repos", safe_repo_name)
+
+            # Check if the repository directory already exists and is not empty
+            if not (os.path.exists(save_repo_dir) and os.listdir(save_repo_dir)):
+                # Only download if the repository doesn't exist or is empty
+                download_repo(repo_info.repoUrl, save_repo_dir, repo_info.type, repo_info.token or "")
+            else:
+                logger.info(f"Repository already exists at {save_repo_dir}. Using existing repository.")
+        else:
+            raise ValueError("Either repoUrl or localPath must be provided in the request.")
+
+        os.makedirs(save_repo_dir, exist_ok=True)
+        logger.info(f"Saved repo path: {save_repo_dir}")
+    except Exception as e:
+        logger.error(f"Failed to create repository structure: {e}")
+        return {"success": False}
+    return {"success": True}
+
 # --- Processed Projects Endpoint --- (New Endpoint)
 @app.get("/api/processed_projects", response_model=List[ProcessedProjectEntry])
 async def get_processed_projects():
@@ -581,48 +712,40 @@ async def get_processed_projects():
     Projects are identified by files named like: deepwiki_cache_{repo_type}_{owner}_{repo}_{language}.json
     """
     project_entries: List[ProcessedProjectEntry] = []
+    wiki_cache_dir = Path(WIKI_CACHE_DIR)
     # WIKI_CACHE_DIR is already defined globally in the file
 
     try:
-        if not os.path.exists(WIKI_CACHE_DIR):
-            logger.info(f"Cache directory {WIKI_CACHE_DIR} not found. Returning empty list.")
+        if not wiki_cache_dir.exists():
+            logger.info(f"Cache directory {wiki_cache_dir} not found. Returning empty list.")
             return []
 
-        logger.info(f"Scanning for project cache files in: {WIKI_CACHE_DIR}")
-        filenames = await asyncio.to_thread(os.listdir, WIKI_CACHE_DIR) # Use asyncio.to_thread for os.listdir
+        logger.info(f"Scanning for project cache files in: {wiki_cache_dir}")
 
-        for filename in filenames:
-            if filename.startswith("deepwiki_cache_") and filename.endswith(".json"):
-                file_path = os.path.join(WIKI_CACHE_DIR, filename)
-                try:
-                    stats = await asyncio.to_thread(os.stat, file_path) # Use asyncio.to_thread for os.stat
-                    parts = filename.replace("deepwiki_cache_", "").replace(".json", "").split('_')
+        for file_path in await asyncio.to_thread(Path.glob, wiki_cache_dir, "deepwiki_cache_*.json"):
+            try:
+                stats = await asyncio.to_thread(os.stat, file_path)  # use asyncio.to_thread for os.stat
+                json_props = json.loads(await asyncio.to_thread(Path.read_bytes, file_path))
+                repo_info = json_props.get("repo") or {}
+                owner = repo_info.get("owner") or ""
+                repo = repo_info.get("repo") or ""
+                repo_type = repo_info.get("type") or ""
+                language = file_path.stem.rpartition("_")[2]  # such as "en"
+            except Exception as e:
+                logger.error(f"Error processing file {file_path}: {e}")
+                continue
 
-                    # Expecting repo_type_owner_repo_language
-                    # Example: deepwiki_cache_github_AsyncFuncAI_deepwiki-open_en.json
-                    # parts = [github, AsyncFuncAI, deepwiki-open, en]
-                    if len(parts) >= 4:
-                        repo_type = parts[0]
-                        owner = parts[1]
-                        language = parts[-1] # language is the last part
-                        repo = "_".join(parts[2:-1]) # repo can contain underscores
-
-                        project_entries.append(
-                            ProcessedProjectEntry(
-                                id=filename,
-                                owner=owner,
-                                repo=repo,
-                                name=f"{owner}/{repo}",
-                                repo_type=repo_type,
-                                submittedAt=int(stats.st_mtime * 1000), # Convert to milliseconds
-                                language=language
-                            )
-                        )
-                    else:
-                        logger.warning(f"Could not parse project details from filename: {filename}")
-                except Exception as e:
-                    logger.error(f"Error processing file {file_path}: {e}")
-                    continue # Skip this file on error
+            project_entries.append(
+                ProcessedProjectEntry(
+                    id=file_path.name,
+                    owner=owner,
+                    repo=repo,
+                    name=f"{owner}/{repo}",
+                    repo_type=repo_type,
+                    submittedAt=int(stats.st_mtime * 1000),  # milliseconds
+                    language=language,
+                )
+            )
 
         # Sort by most recent first
         project_entries.sort(key=lambda p: p.submittedAt, reverse=True)
@@ -630,5 +753,5 @@ async def get_processed_projects():
         return project_entries
 
     except Exception as e:
-        logger.error(f"Error listing processed projects from {WIKI_CACHE_DIR}: {e}", exc_info=True)
+        logger.error(f"Error listing processed projects from {wiki_cache_dir}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to list processed projects from server cache.")

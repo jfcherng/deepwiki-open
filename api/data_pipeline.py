@@ -12,6 +12,7 @@ import glob
 from adalflow.utils import get_adalflow_default_root_path
 from adalflow.core.db import LocalDB
 from api.config import configs, DEFAULT_EXCLUDED_DIRS, DEFAULT_EXCLUDED_FILES
+from api.gerrit import RealtekGerrit
 from api.ollama_patch import OllamaDocumentProcessor
 from urllib.parse import urlparse, urlunparse, quote
 import requests
@@ -88,34 +89,51 @@ def download_repo(repo_url: str, local_path: str, type: str = "github", access_t
 
         # Prepare the clone URL with access token if provided
         clone_url = repo_url
-        if access_token:
-            parsed = urlparse(repo_url)
-            # Determine the repository type and format the URL accordingly
-            if type == "github":
-                # Format: https://{token}@{domain}/owner/repo.git
-                # Works for both github.com and enterprise GitHub domains
+        parsed = urlparse(repo_url)
+        # Determine the repository type and format the URL accordingly
+        if type == "github":
+            # Format: https://{token}@{domain}/owner/repo.git
+            # Works for both github.com and enterprise GitHub domains
+            if access_token:
                 clone_url = urlunparse((parsed.scheme, f"{access_token}@{parsed.netloc}", parsed.path, '', '', ''))
-            elif type == "gitlab":
-                # Format: https://oauth2:{token}@gitlab.com/owner/repo.git
+        elif type == "gitlab":
+            # Format: https://oauth2:{token}@gitlab.com/owner/repo.git
+            if access_token:
                 clone_url = urlunparse((parsed.scheme, f"oauth2:{access_token}@{parsed.netloc}", parsed.path, '', '', ''))
-            elif type == "bitbucket":
-                # Format: https://x-token-auth:{token}@bitbucket.org/owner/repo.git
+        elif type == "bitbucket":
+            # Format: https://x-token-auth:{token}@bitbucket.org/owner/repo.git
+            if access_token:
                 clone_url = urlunparse((parsed.scheme, f"x-token-auth:{access_token}@{parsed.netloc}", parsed.path, '', '', ''))
-
-            logger.info("Using access token for authentication")
+        elif type == "gerrit":
+            # Format: https://<username>:<http_password>@gerrit.example.com/<repo>
+            # access_token = <username>:<http_password>
+            repo_info = RealtekGerrit.parse_url(repo_url)
+            assert repo_info, f"Invalid Gerrit URL: {repo_url}"
+            parsed = urlparse(f'{repo_info.base_url}/{repo_info.project}')
+            if access_token:
+                clone_url = urlunparse((parsed.scheme, f"{access_token}@{parsed.netloc}", parsed.path, '', '', ''))
+            else:
+                clone_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', '', ''))
+            logger.info(f"⚠️⚠️⚠️ Using Gerrit clone URL: {clone_url}")
+        logger.info("Using access token for authentication")
 
         # Clone the repository
         logger.info(f"Cloning repository from {repo_url} to {local_path}")
         # We use repo_url in the log to avoid exposing the token in logs
-        result = subprocess.run(
+        proc = subprocess.Popen(
             ["git", "clone", "--depth=1", "--single-branch", clone_url, local_path],
-            check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            text=True,
         )
+        stdout, stderr = proc.communicate()
+
+        if str(proc.returncode) != "0":
+            logger.error(f"Git clone failed with error: {stderr}")
+            return stderr
 
         logger.info("Repository cloned successfully")
-        return result.stdout.decode("utf-8")
+        return stdout
 
     except subprocess.CalledProcessError as e:
         error_msg = e.stderr.decode('utf-8')
@@ -417,9 +435,9 @@ def get_github_file_content(repo_url: str, file_path: str, access_token: str = N
     """
     Retrieves the content of a file from a GitHub repository using the GitHub API.
     Supports both public GitHub (github.com) and GitHub Enterprise (custom domains).
-    
+
     Args:
-        repo_url (str): The URL of the GitHub repository 
+        repo_url (str): The URL of the GitHub repository
                        (e.g., "https://github.com/username/repo" or "https://github.company.com/username/repo")
         file_path (str): The path to the file within the repository (e.g., "src/main.py")
         access_token (str, optional): GitHub personal access token for private repositories
@@ -451,7 +469,7 @@ def get_github_file_content(repo_url: str, file_path: str, access_token: str = N
         else:
             # GitHub Enterprise - API is typically at https://domain/api/v3/
             api_base = f"{parsed_url.scheme}://{parsed_url.netloc}/api/v3"
-        
+
         # Use GitHub API to get file content
         # The API endpoint for getting file content is: /repos/{owner}/{repo}/contents/{path}
         api_url = f"{api_base}/repos/{owner}/{repo}/contents/{file_path}"
@@ -532,7 +550,7 @@ def get_gitlab_file_content(repo_url: str, file_path: str, access_token: str = N
             project_headers = {}
             if access_token:
                 project_headers["PRIVATE-TOKEN"] = access_token
-            
+
             project_response = requests.get(project_info_url, headers=project_headers)
             if project_response.status_code == 200:
                 project_data = project_response.json()
@@ -603,7 +621,7 @@ def get_bitbucket_file_content(repo_url: str, file_path: str, access_token: str 
             repo_headers = {}
             if access_token:
                 repo_headers["Authorization"] = f"Bearer {access_token}"
-            
+
             repo_response = requests.get(repo_info_url, headers=repo_headers)
             if repo_response.status_code == 200:
                 repo_data = repo_response.json()
@@ -647,6 +665,8 @@ def get_bitbucket_file_content(repo_url: str, file_path: str, access_token: str 
     except Exception as e:
         raise ValueError(f"Failed to get file content: {str(e)}")
 
+def get_gerrit_file_content(repo_url: str, file_path: str, access_token: str = None) -> str:
+    raise NotImplementedError
 
 def get_file_content(repo_url: str, file_path: str, type: str = "github", access_token: str = None) -> str:
     """
@@ -669,6 +689,8 @@ def get_file_content(repo_url: str, file_path: str, type: str = "github", access
         return get_gitlab_file_content(repo_url, file_path, access_token)
     elif type == "bitbucket":
         return get_bitbucket_file_content(repo_url, file_path, access_token)
+    elif type == "gerrit":
+        return get_gerrit_file_content(repo_url, file_path, access_token)
     else:
         raise ValueError("Unsupported repository URL. Only GitHub and GitLab are supported.")
 
@@ -714,7 +736,12 @@ class DatabaseManager:
         self.repo_url_or_path = None
         self.repo_paths = None
 
-    def _extract_repo_name_from_url(self, repo_url_or_path: str, repo_type: str) -> str:
+    @staticmethod
+    def extract_safe_repo_path_from_url(repo_url_or_path: str, repo_type: str) -> str:
+        """
+        Extract a safe repo path from the URL or local path. E.g., `owner@repo_name`.
+        The repo name may contains `/`. Replace `/` with `__` to make it safe for local path.
+        """
         # Extract owner and repo name to create unique identifier
         url_parts = repo_url_or_path.rstrip('/').split('/')
 
@@ -723,18 +750,38 @@ class DatabaseManager:
             # GitLab URL format: https://gitlab.com/owner/repo or https://gitlab.com/group/subgroup/repo
             # Bitbucket URL format: https://bitbucket.org/owner/repo
             owner = url_parts[-2]
-            repo = url_parts[-1].replace(".git", "")
-            repo_name = f"{owner}_{repo}"
+            repo = url_parts[-1].removesuffix(".git")
+            repo_name = f"{owner}@{repo}"
+        elif repo_type == "gerrit" and (gerrit_url_info := RealtekGerrit.parse_url(repo_url_or_path)):
+            repo_name = f"{gerrit_url_info.owner}@{gerrit_url_info.project}"
         else:
-            repo_name = url_parts[-1].replace(".git", "")
+            repo_name = url_parts[-1].removesuffix(".git")
+        return repo_name.replace("/", "__")  # safe for local path
+
+    @staticmethod
+    def extract_repo_name_from_url(repo_url_or_path: str, repo_type: str) -> str:
+        # Extract owner and repo name to create unique identifier
+        url_parts = repo_url_or_path.rstrip('/').split('/')
+
+        if repo_type in ["github", "gitlab", "bitbucket"] and len(url_parts) >= 5:
+            # GitHub URL format: https://github.com/owner/repo
+            # GitLab URL format: https://gitlab.com/owner/repo or https://gitlab.com/group/subgroup/repo
+            # Bitbucket URL format: https://bitbucket.org/owner/repo
+            owner = url_parts[-2]
+            repo = url_parts[-1].removesuffix(".git")
+            repo_name = f"{owner}@{repo}"
+        elif repo_type == "gerrit" and (gerrit_url_info := RealtekGerrit.parse_url(repo_url_or_path)):
+            repo_name = f"{gerrit_url_info.owner}@{gerrit_url_info.project}"
+        else:
+            repo_name = url_parts[-1].removesuffix(".git")
         return repo_name
 
     def _create_repo(self, repo_url_or_path: str, repo_type: str = "github", access_token: str = None) -> None:
         """
         Download and prepare all paths.
         Paths:
-        ~/.adalflow/repos/{owner}_{repo_name} (for url, local path will be the same)
-        ~/.adalflow/databases/{owner}_{repo_name}.pkl
+        ~/.adalflow/repos/{owner}@{repo_name} (for url, local path will be the same)
+        ~/.adalflow/databases/{owner}@{repo_name}.pkl
 
         Args:
             repo_url_or_path (str): The URL or local path of the repository
@@ -749,10 +796,10 @@ class DatabaseManager:
             # url
             if repo_url_or_path.startswith("https://") or repo_url_or_path.startswith("http://"):
                 # Extract the repository name from the URL
-                repo_name = self._extract_repo_name_from_url(repo_url_or_path, repo_type)
-                logger.info(f"Extracted repo name: {repo_name}")
+                safe_repo_name = self.extract_safe_repo_path_from_url(repo_url_or_path, repo_type)
+                logger.info(f"Extracted repo name: {safe_repo_name}")
 
-                save_repo_dir = os.path.join(root_path, "repos", repo_name)
+                save_repo_dir = os.path.join(root_path, "repos", safe_repo_name)
 
                 # Check if the repository directory already exists and is not empty
                 if not (os.path.exists(save_repo_dir) and os.listdir(save_repo_dir)):
@@ -761,10 +808,10 @@ class DatabaseManager:
                 else:
                     logger.info(f"Repository already exists at {save_repo_dir}. Using existing repository.")
             else:  # local path
-                repo_name = os.path.basename(repo_url_or_path)
+                safe_repo_name = os.path.basename(repo_url_or_path)
                 save_repo_dir = repo_url_or_path
 
-            save_db_file = os.path.join(root_path, "databases", f"{repo_name}.pkl")
+            save_db_file = os.path.join(root_path, "databases", f"{safe_repo_name}.pkl")
             os.makedirs(save_repo_dir, exist_ok=True)
             os.makedirs(os.path.dirname(save_db_file), exist_ok=True)
 

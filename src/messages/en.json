@@ -12,6 +12,7 @@
   },
   "loading": {
     "initializing": "Initializing wiki generation...",
+    "cloningRepository": "Cloning repository...",
     "fetchingStructure": "Fetching repository structure...",
     "determiningStructure": "Determining wiki structure...",
     "clearingCache": "Clearing server cache...",

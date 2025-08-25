@@ -8,7 +8,7 @@ import ThemeToggle from '@/components/theme-toggle';
 import WikiTreeView from '@/components/WikiTreeView';
 import { useLanguage } from '@/contexts/LanguageContext';
 import { RepoInfo } from '@/types/repoinfo';
-import getRepoUrl from '@/utils/getRepoUrl';
+import getRepoUrl, { extractRtkGerritUrlInfo, isRtkGerritUrl } from '@/utils/getRepoUrl';
 import { extractUrlDomain, extractUrlPath } from '@/utils/urlDecoder';
 import Link from 'next/link';
 import { useParams, useSearchParams } from 'next/navigation';
@@ -181,7 +181,7 @@ export default function RepoWikiPage() {
 
   // Extract owner and repo from route params
   const owner = params.owner as string;
-  const repo = params.repo as string;
+  const repo = decodeURIComponent(params.repo as string);
 
   // Extract tokens from search params
   const token = searchParams.get('token') || '';
@@ -290,7 +290,12 @@ export default function RepoWikiPage() {
       const url = new URL(repoUrl);
       const hostname = url.hostname;
       
-      if (hostname === 'github.com' || hostname.includes('github')) {
+      const gerrit_info = extractRtkGerritUrlInfo(repoUrl);
+
+      if (gerrit_info) {
+        // Gerrit URL format: https://GERRIT_HOST/plugins/gitiles/REPO_NAME/+/BRANCH_REF/FILE_PATH?format=TEXT
+        return `${gerrit_info.baseUrl}/plugins/gitiles/${gerrit_info.repo}/+/refs/heads/${defaultBranch}/${filePath}`;
+      } else if (hostname === 'github.com' || hostname.includes('github')) {
         // GitHub URL format: https://github.com/owner/repo/blob/branch/path
         return `${repoUrl}/blob/${defaultBranch}/${filePath}`;
       } else if (hostname === 'gitlab.com' || hostname.includes('gitlab')) {
@@ -683,7 +688,7 @@ Remember:
         type: effectiveRepoInfo.type,
         messages: [{
           role: 'user',
-content: `Analyze this GitHub repository ${owner}/${repo} and create a wiki structure for it.
+content: `Analyze this repository ${owner}/${repo} and create a wiki structure for it.
 
 1. The complete file tree of the project:
 <file_tree>
@@ -1137,6 +1142,25 @@ IMPORTANT:
     }
   }, [generatePageContent, currentToken, effectiveRepoInfo, pagesInProgress.size, structureRequestInProgress, selectedProviderState, selectedModelState, isCustomSelectedModelState, customSelectedModelState, modelExcludedDirs, modelExcludedFiles, language, messages.loading, isComprehensiveView]);
 
+  const cloneRepository = useCallback(async (repo_info: RepoInfo) => {
+    console.log(`⚠️ repo_info = ${repo_info}`);
+
+    try {
+      const response = await fetch(`/clone_repo`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({repo: repo_info}),
+      });
+
+      if (!response.ok) {
+        const errorData = await response.text();
+        throw new Error(`Clone API error (${response.status}): ${errorData}`);
+      }
+    } catch (err) {
+      throw err;
+    }
+  }, []);
+
   // Fetch repository structure using GitHub or GitLab API
   const fetchRepositoryStructure = useCallback(async () => {
     // If a request is already in progress, don't start another one
@@ -1159,299 +1183,38 @@ IMPORTANT:
 
       // Update loading state
       setIsLoading(true);
+
+      setLoadingMessage(messages.loading?.cloneRepository || 'Cloning repository...');
+      await cloneRepository(effectiveRepoInfo);
+
       setLoadingMessage(messages.loading?.fetchingStructure || 'Fetching repository structure...');
 
       let fileTreeData = '';
       let readmeContent = '';
 
-      if (effectiveRepoInfo.type === 'local' && effectiveRepoInfo.localPath) {
-        try {
-          const response = await fetch(`/local_repo/structure?path=${encodeURIComponent(effectiveRepoInfo.localPath)}`);
+      try {
+        const params = new URLSearchParams({
+          "owner": effectiveRepoInfo.owner,
+          "repo": effectiveRepoInfo.repo,
+          "type": effectiveRepoInfo.type,
+          "repoUrl": effectiveRepoInfo.repoUrl || '',
+          "localPath": effectiveRepoInfo.localPath || '',
+        });
+        const response = await fetch(`/cloned_repo/structure?${params}`);
 
-          if (!response.ok) {
-            const errorData = await response.text();
-            throw new Error(`Local repository API error (${response.status}): ${errorData}`);
-          }
-
-          const data = await response.json();
-          fileTreeData = data.file_tree;
-          readmeContent = data.readme;
-          // For local repos, we can't determine the actual branch, so use 'main' as default
-          setDefaultBranch('main');
-        } catch (err) {
-          throw err;
-        }
-      } else if (effectiveRepoInfo.type === 'github') {
-        // GitHub API approach
-        // Try to get the tree data for common branch names
-        let treeData = null;
-        let apiErrorDetails = '';
-
-        // Determine the GitHub API base URL based on the repository URL
-        const getGithubApiUrl = (repoUrl: string | null): string => {
-          if (!repoUrl) {
-            return 'https://api.github.com'; // Default to public GitHub
-          }
-          
-          try {
-            const url = new URL(repoUrl);
-            const hostname = url.hostname;
-            
-            // If it's the public GitHub, use the standard API URL
-            if (hostname === 'github.com') {
-              return 'https://api.github.com';
-            }
-            
-            // For GitHub Enterprise, use the enterprise API URL format
-            // GitHub Enterprise API URL format: https://github.company.com/api/v3
-            return `${url.protocol}//${hostname}/api/v3`;
-          } catch {
-            return 'https://api.github.com'; // Fallback to public GitHub if URL parsing fails
-          }
-        };
-
-        const githubApiBaseUrl = getGithubApiUrl(effectiveRepoInfo.repoUrl);
-        // First, try to get the default branch from the repository info
-        let defaultBranchLocal = null;
-        try {
-          const repoInfoResponse = await fetch(`${githubApiBaseUrl}/repos/${owner}/${repo}`, {
-            headers: createGithubHeaders(currentToken)
-          });
-          
-          if (repoInfoResponse.ok) {
-            const repoData = await repoInfoResponse.json();
-            defaultBranchLocal = repoData.default_branch;
-            console.log(`Found default branch: ${defaultBranchLocal}`);
-            // Store the default branch in state
-            setDefaultBranch(defaultBranchLocal || 'main');
-          }
-        } catch (err) {
-          console.warn('Could not fetch repository info for default branch:', err);
+        if (!response.ok) {
+          const errorData = await response.text();
+          throw new Error(`Get cloned repository structure API error (${response.status}): ${errorData}`);
         }
 
-        // Create list of branches to try, prioritizing the actual default branch
-        const branchesToTry = defaultBranchLocal 
-          ? [defaultBranchLocal, 'main', 'master'].filter((branch, index, arr) => arr.indexOf(branch) === index)
-          : ['main', 'master'];
-
-        for (const branch of branchesToTry) {
-          const apiUrl = `${githubApiBaseUrl}/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`;
-          const headers = createGithubHeaders(currentToken);
-
-          console.log(`Fetching repository structure from branch: ${branch}`);
-          try {
-            const response = await fetch(apiUrl, {
-              headers
-            });
-
-            if (response.ok) {
-              treeData = await response.json();
-              console.log('Successfully fetched repository structure');
-              break;
-            } else {
-              const errorData = await response.text();
-              apiErrorDetails = `Status: ${response.status}, Response: ${errorData}`;
-              console.error(`Error fetching repository structure: ${apiErrorDetails}`);
-            }
-          } catch (err) {
-            console.error(`Network error fetching branch ${branch}:`, err);
-          }
+        const data = await response.json();
+        fileTreeData = data.file_tree;
+        readmeContent = data.readme;
+        if (data.branch) {
+          setDefaultBranch(data.branch);
         }
-
-        if (!treeData || !treeData.tree) {
-          if (apiErrorDetails) {
-            throw new Error(`Could not fetch repository structure. API Error: ${apiErrorDetails}`);
-          } else {
-            throw new Error('Could not fetch repository structure. Repository might not exist, be empty or private.');
-          }
-        }
-
-        // Convert tree data to a string representation
-        fileTreeData = treeData.tree
-          .filter((item: { type: string; path: string }) => item.type === 'blob')
-          .map((item: { type: string; path: string }) => item.path)
-          .join('\n');
-
-        // Try to fetch README.md content
-        try {
-          const headers = createGithubHeaders(currentToken);
-
-          const readmeResponse = await fetch(`${githubApiBaseUrl}/repos/${owner}/${repo}/readme`, {
-            headers
-          });
-
-          if (readmeResponse.ok) {
-            const readmeData = await readmeResponse.json();
-            readmeContent = atob(readmeData.content);
-          } else {
-            console.warn(`Could not fetch README.md, status: ${readmeResponse.status}`);
-          }
-        } catch (err) {
-          console.warn('Could not fetch README.md, continuing with empty README', err);
-        }
-      }
-      else if (effectiveRepoInfo.type === 'gitlab') {
-        // GitLab API approach
-        const projectPath = extractUrlPath(effectiveRepoInfo.repoUrl ?? '') ?? `${owner}/${repo}`;
-        const projectDomain = extractUrlDomain(effectiveRepoInfo.repoUrl ?? "https://gitlab.com");
-        const encodedProjectPath = encodeURIComponent(projectPath);
-
-        const headers = createGitlabHeaders(currentToken);
-
-        /* eslint-disable-next-line @typescript-eslint/no-explicit-any */
-        const filesData: any[] = [];
-
-        try {
-          // Step 1: Get project info to determine default branch
-          let projectInfoUrl: string;
-          let defaultBranchLocal = 'main'; // fallback
-          try {
-            const validatedUrl = new URL(projectDomain ?? ''); // Validate domain
-            projectInfoUrl = `${validatedUrl.origin}/api/v4/projects/${encodedProjectPath}`;
-          } catch (err) {
-            throw new Error(`Invalid project domain URL: ${projectDomain}`);
-          }
-          const projectInfoRes = await fetch(projectInfoUrl, { headers });
-
-          if (!projectInfoRes.ok) {
-            const errorData = await projectInfoRes.text();
-            throw new Error(`GitLab project info error: Status ${projectInfoRes.status}, Response: ${errorData}`);
-          }
-
-          const projectInfo = await projectInfoRes.json();
-          defaultBranchLocal = projectInfo.default_branch || 'main';
-          console.log(`Found GitLab default branch: ${defaultBranchLocal}`);
-          // Store the default branch in state
-          setDefaultBranch(defaultBranchLocal);
-
-          // Step 2: Paginate to fetch full file tree
-          let page = 1;
-          let morePages = true;
-          
-          while (morePages) {
-            const apiUrl = `${projectInfoUrl}/repository/tree?recursive=true&per_page=100&page=${page}`;
-            const response = await fetch(apiUrl, { headers });
-
-            if (!response.ok) {
-                const errorData = await response.text();
-              throw new Error(`Error fetching GitLab repository structure (page ${page}): ${errorData}`);
-            }
-
-            const pageData = await response.json();
-            filesData.push(...pageData);
-
-            const nextPage = response.headers.get('x-next-page');
-            morePages = !!nextPage;
-            page = nextPage ? parseInt(nextPage, 10) : page + 1;
-        }
-
-          if (!Array.isArray(filesData) || filesData.length === 0) {
-            throw new Error('Could not fetch repository structure. Repository might be empty or inaccessible.');
-        }
-
-          // Step 3: Format file paths
-        fileTreeData = filesData
-          .filter((item: { type: string; path: string }) => item.type === 'blob')
-          .map((item: { type: string; path: string }) => item.path)
-          .join('\n');
-
-          // Step 4: Try to fetch README.md content
-          const readmeUrl = `${projectInfoUrl}/repository/files/README.md/raw`;
-            try {
-            const readmeResponse = await fetch(readmeUrl, { headers });
-              if (readmeResponse.ok) {
-                readmeContent = await readmeResponse.text();
-                console.log('Successfully fetched GitLab README.md');
-              } else {
-              console.warn(`Could not fetch GitLab README.md status: ${readmeResponse.status}`);
-              }
-            } catch (err) {
-            console.warn(`Error fetching GitLab README.md:`, err);
-            }
-        } catch (err) {
-          console.error("Error during GitLab repository tree retrieval:", err);
-          throw err;
-        }
-      }
-      else if (effectiveRepoInfo.type === 'bitbucket') {
-        // Bitbucket API approach
-        const repoPath = extractUrlPath(effectiveRepoInfo.repoUrl ?? '') ?? `${owner}/${repo}`;
-        const encodedRepoPath = encodeURIComponent(repoPath);
-
-        // Try to get the file tree for common branch names
-        let filesData = null;
-        let apiErrorDetails = '';
-        let defaultBranchLocal = '';
-        const headers = createBitbucketHeaders(currentToken);
-
-        // First get project info to determine default branch
-        const projectInfoUrl = `https://api.bitbucket.org/2.0/repositories/${encodedRepoPath}`;
-        try {
-          const response = await fetch(projectInfoUrl, { headers });
-
-          const responseText = await response.text();
-
-          if (response.ok) {
-            const projectData = JSON.parse(responseText);
-            defaultBranchLocal = projectData.mainbranch.name;
-            // Store the default branch in state
-            setDefaultBranch(defaultBranchLocal);
-
-            const apiUrl = `https://api.bitbucket.org/2.0/repositories/${encodedRepoPath}/src/${defaultBranchLocal}/?recursive=true&per_page=100`;
-            try {
-              const response = await fetch(apiUrl, {
-                headers
-              });
-
-              const structureResponseText = await response.text();
-
-              if (response.ok) {
-                filesData = JSON.parse(structureResponseText);
-              } else {
-                const errorData = structureResponseText;
-                apiErrorDetails = `Status: ${response.status}, Response: ${errorData}`;
-              }
-            } catch (err) {
-              console.error(`Network error fetching Bitbucket branch ${defaultBranchLocal}:`, err);
-            }
-          } else {
-            const errorData = responseText;
-            apiErrorDetails = `Status: ${response.status}, Response: ${errorData}`;
-          }
-        } catch (err) {
-          console.error("Network error fetching Bitbucket project info:", err);
-        }
-
-        if (!filesData || !Array.isArray(filesData.values) || filesData.values.length === 0) {
-          if (apiErrorDetails) {
-            throw new Error(`Could not fetch repository structure. Bitbucket API Error: ${apiErrorDetails}`);
-          } else {
-            throw new Error('Could not fetch repository structure. Repository might not exist, be empty or private.');
-          }
-        }
-
-        // Convert files data to a string representation
-        fileTreeData = filesData.values
-          .filter((item: { type: string; path: string }) => item.type === 'commit_file')
-          .map((item: { type: string; path: string }) => item.path)
-          .join('\n');
-
-        // Try to fetch README.md content
-        try {
-          const headers = createBitbucketHeaders(currentToken);
-
-          const readmeResponse = await fetch(`https://api.bitbucket.org/2.0/repositories/${encodedRepoPath}/src/${defaultBranchLocal}/README.md`, {
-            headers
-          });
-
-          if (readmeResponse.ok) {
-            readmeContent = await readmeResponse.text();
-          } else {
-            console.warn(`Could not fetch Bitbucket README.md, status: ${readmeResponse.status}`);
-          }
-        } catch (err) {
-          console.warn('Could not fetch Bitbucket README.md, continuing with empty README', err);
-        }
+      } catch (err) {
+        throw err;
       }
 
       // Now determine the wiki structure
@@ -1466,7 +1229,7 @@ IMPORTANT:
       // Reset the request in progress flag
       setRequestInProgress(false);
     }
-  }, [owner, repo, determineWikiStructure, currentToken, effectiveRepoInfo, requestInProgress, messages.loading]);
+  }, [owner, repo, cloneRepository, determineWikiStructure, currentToken, effectiveRepoInfo, requestInProgress, messages.loading]);
 
   // Function to export wiki content
   const exportWiki = useCallback(async (format: 'markdown' | 'json') => {
