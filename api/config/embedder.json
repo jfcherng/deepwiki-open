@@ -1,10 +1,14 @@
 {
   "embedder": {
+    "model_client": "OpenAIClient",
     "client_class": "OpenAIClient",
-    "batch_size": 500,
+    "initialize_kwargs": {
+      "api_key": "${OPENAI_API_KEY}",
+      "base_url": "${OPENAI_BASE_URL}"
+    },
+    "batch_size": 200,
     "model_kwargs": {
-      "model": "text-embedding-3-small",
-      "dimensions": 256,
+      "model": "embedding-chattek-qwen",
       "encoding_format": "float"
     }
   },
