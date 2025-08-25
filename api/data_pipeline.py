@@ -101,7 +101,10 @@ def download_repo(repo_url: str, local_path: str, type: str = "github", access_t
             elif type == "bitbucket":
                 # Format: https://x-token-auth:{token}@bitbucket.org/owner/repo.git
                 clone_url = urlunparse((parsed.scheme, f"x-token-auth:{access_token}@{parsed.netloc}", parsed.path, '', '', ''))
-
+            elif type == "gerrit":
+                # Format: https://<username>:<password>@gerrit.example.com/<repo>
+                # access_token = <username>:<password>
+                clone_url = urlunparse((parsed.scheme, f"{access_token}@{parsed.netloc}", parsed.path, '', '', ''))
             logger.info("Using access token for authentication")
 
         # Clone the repository
@@ -417,9 +420,9 @@ def get_github_file_content(repo_url: str, file_path: str, access_token: str = N
     """
     Retrieves the content of a file from a GitHub repository using the GitHub API.
     Supports both public GitHub (github.com) and GitHub Enterprise (custom domains).
-    
+
     Args:
-        repo_url (str): The URL of the GitHub repository 
+        repo_url (str): The URL of the GitHub repository
                        (e.g., "https://github.com/username/repo" or "https://github.company.com/username/repo")
         file_path (str): The path to the file within the repository (e.g., "src/main.py")
         access_token (str, optional): GitHub personal access token for private repositories
@@ -451,7 +454,7 @@ def get_github_file_content(repo_url: str, file_path: str, access_token: str = N
         else:
             # GitHub Enterprise - API is typically at https://domain/api/v3/
             api_base = f"{parsed_url.scheme}://{parsed_url.netloc}/api/v3"
-        
+
         # Use GitHub API to get file content
         # The API endpoint for getting file content is: /repos/{owner}/{repo}/contents/{path}
         api_url = f"{api_base}/repos/{owner}/{repo}/contents/{file_path}"
@@ -532,7 +535,7 @@ def get_gitlab_file_content(repo_url: str, file_path: str, access_token: str = N
             project_headers = {}
             if access_token:
                 project_headers["PRIVATE-TOKEN"] = access_token
-            
+
             project_response = requests.get(project_info_url, headers=project_headers)
             if project_response.status_code == 200:
                 project_data = project_response.json()
@@ -603,7 +606,7 @@ def get_bitbucket_file_content(repo_url: str, file_path: str, access_token: str 
             repo_headers = {}
             if access_token:
                 repo_headers["Authorization"] = f"Bearer {access_token}"
-            
+
             repo_response = requests.get(repo_info_url, headers=repo_headers)
             if repo_response.status_code == 200:
                 repo_data = repo_response.json()
@@ -647,6 +650,8 @@ def get_bitbucket_file_content(repo_url: str, file_path: str, access_token: str 
     except Exception as e:
         raise ValueError(f"Failed to get file content: {str(e)}")
 
+def get_gerrit_file_content(repo_url: str, file_path: str, access_token: str = None) -> str:
+    raise NotImplementedError
 
 def get_file_content(repo_url: str, file_path: str, type: str = "github", access_token: str = None) -> str:
     """
@@ -669,6 +674,8 @@ def get_file_content(repo_url: str, file_path: str, type: str = "github", access
         return get_gitlab_file_content(repo_url, file_path, access_token)
     elif type == "bitbucket":
         return get_bitbucket_file_content(repo_url, file_path, access_token)
+    elif type == "gerrit":
+        return get_gerrit_file_content(repo_url, file_path, access_token)
     else:
         raise ValueError("Unsupported repository URL. Only GitHub and GitLab are supported.")
 
